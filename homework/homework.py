@@ -95,3 +95,154 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+import numpy as np
+import os
+import gzip
+import pickle
+import json
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
+from sklearn.svm import SVC
+from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    make_scorer,
+    precision_score,
+    balanced_accuracy_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    average_precision_score,
+)
+
+
+def load_and_clean(path):
+    df = pd.read_csv(path, compression="zip")
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns=["ID"])
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 5
+
+    X = df.drop(columns=["default"])
+    y = df["default"]
+    df = df.dropna()
+
+    return X, y
+
+
+def save_model_gzip(model, path="files/models/model.pkl.gz"):
+    with gzip.open(path, "wb") as f:
+        pickle.dump(model, f)
+
+
+def create_dirs():
+    if not os.path.exists("files/models"):
+        os.mkdir("files/models")
+
+    if not os.path.exists("files/output"):
+        os.mkdir("files/output")
+
+
+def save_classification_metrics(
+    model, x_train, y_train, x_test, y_test, path="files/output/metrics.json"
+):
+    metrics = []
+    model = model.best_estimator_
+
+    for X, y, name in [(x_train, y_train, "train"), (x_test, y_test, "test")]:
+        y_pred = model.predict(X)
+        entry = {
+            "type": "metrics",
+            "dataset": name,
+            "precision": precision_score(y, y_pred),
+            "balanced_accuracy": balanced_accuracy_score(y, y_pred),
+            "recall": recall_score(y, y_pred),
+            "f1_score": f1_score(y, y_pred),
+        }
+        metrics.append(entry)
+
+    with open(path, "w") as f:
+        for entry in metrics:
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def save_confusion_matrices(
+    model, x_train, y_train, x_test, y_test, path="files/output/metrics.json"
+):
+    results = []
+    model = model.best_estimator_
+
+    for X, y, name in [(x_train, y_train, "train"), (x_test, y_test, "test")]:
+        y_pred = model.predict(X)
+        tn, fp, fn, tp = confusion_matrix(y, y_pred).ravel()
+
+        result = {
+            "type": "cm_matrix",
+            "dataset": name,
+            "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+            "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+        }
+        results.append(result)
+
+    with open(path, "a") as f:
+        for entry in results:
+            json.dump(entry, f)
+            f.write("\n")
+
+
+x_train, y_train = load_and_clean("files/input/train_data.csv.zip")
+x_test, y_test = load_and_clean("files/input/test_data.csv.zip")
+
+categorical_features = (
+    x_train.select_dtypes(include=["object", "category", "int64"])
+    .columns[x_train.nunique() < 10]
+    .tolist()
+)
+
+numerical_features = [col for col in x_train.columns if col not in categorical_features]
+
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+        ("num", StandardScaler(), numerical_features),
+    ],
+    remainder="passthrough",
+)
+
+pipeline = Pipeline(
+    [
+        ("preprocessor", preprocessor),
+        ("pca", PCA(n_components="mle")),
+        ("selector", SelectKBest(f_classif)),
+        ("classifier", SVC(random_state=42)),
+    ]
+)
+
+
+param_grid = {
+    "selector__k": [12, 13],
+    "classifier__gamma": [0.1],
+    "pca__n_components": [21],
+}
+
+scorer = make_scorer(balanced_accuracy_score)
+
+grid_search = GridSearchCV(
+    pipeline, param_grid, cv=10, scoring=scorer, n_jobs=-1, verbose=4
+)
+
+grid_search.fit(x_train, y_train)
+
+
+create_dirs()
+
+print(grid_search.best_params_)
+save_model_gzip(grid_search)
+
+save_classification_metrics(grid_search, x_train, y_train, x_test, y_test)
+save_confusion_matrices(grid_search, x_train, y_train, x_test, y_test)
